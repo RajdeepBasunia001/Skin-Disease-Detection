@@ -1,0 +1,19 @@
+# Ignore the data folder
+skin-disease-detection/data/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# VSCode settings
+.vscode/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
