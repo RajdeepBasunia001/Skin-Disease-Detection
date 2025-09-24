@@ -1,138 +1,164 @@
-# src/explain.py
+# =======================================================
+# src/evaluate.py
+# =======================================================
+
 import os
-import sys
+import json
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-import cv2
 from pathlib import Path
-import json
+from tqdm import tqdm
+from sklearn.metrics import balanced_accuracy_score, classification_report, confusion_matrix, roc_curve, auc
+import seaborn as sns
+import multiprocessing
 
-# --- Project root ---
-ROOT_DIR = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT_DIR))
-
-from src.models import EfficientNetB0
+from src.dataset import SkinDataset
 from src.dataloader import get_dataloaders
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# --- Configuration ---
+ROOT_DIR = Path(__file__).resolve().parent.parent
+PROCESSED_DIR = ROOT_DIR / "data" / "processed"
+REPORTS_DIR = ROOT_DIR / "outputs" / "reports"
+MISCLASSIFIED_DIR = REPORTS_DIR / "misclassified"
 
-def preprocess_image(image_tensor):
-    """
-    Convert tensor to numpy image for visualization
-    """
-    # Denormalize the image tensor
-    mean = np.array([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1)
-    std = np.array([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1)
-    
-    image = image_tensor.cpu().numpy()
-    image = std * image + mean
-    image = np.clip(image, 0, 1)
-    
-    # Convert to HWC format for plotting
-    image = image.transpose(0, 2, 3, 1).squeeze()
-    
-    return np.uint8(255 * image)
+BATCH_SIZE = 32
 
-class GradCAM:
-    def __init__(self, model, target_layer):
-        self.model = model
-        self.target_layer = target_layer
-        self.gradients = None
-        self.activations = None
-        self.hook_layers()
+# =======================================================
+# Helper functions
+# =======================================================
+def plot_confusion_matrix(y_true, y_pred, class_names, save_path):
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt="d", xticklabels=class_names, yticklabels=class_names, cmap="Blues")
+    plt.ylabel("True Label")
+    plt.xlabel("Predicted Label")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"🖼 Confusion matrix saved to: {save_path}")
 
-    def hook_layers(self):
-        def forward_hook(module, input, output):
-            self.activations = output.detach()
+def plot_roc_curves(y_true_one_hot, y_score, class_names, save_path):
+    plt.figure(figsize=(12, 10))
+    for i, class_name in enumerate(class_names):
+        fpr, tpr, _ = roc_curve(y_true_one_hot[:, i], y_score[:, i])
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, lw=2, label=f"{class_name} (AUC = {roc_auc:.2f})")
+    plt.plot([0,1], [0,1], linestyle="--", color="gray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves")
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"🖼 ROC-AUC curves saved to: {save_path}")
 
-        # FIX: Replace register_backward_hook with register_full_backward_hook
-        def backward_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0].detach()
+def visualize_misclassified_samples(misclassified_list, class_names, max_samples=25):
+    print(f"🖼 Visualizing {min(len(misclassified_list), max_samples)} misclassified samples...")
+    temp_dataset = SkinDataset(
+        csv_path=PROCESSED_DIR / "test.csv",
+        processed_dir=PROCESSED_DIR,
+        split_name="test",
+        is_train=False,
+        already_resized=True,
+        use_without_hair=True
+    )
+    fig, axes = plt.subplots(
+        nrows=int(np.ceil(min(len(misclassified_list), max_samples) / 5)),
+        ncols=5, figsize=(20, 15)
+    )
+    axes = axes.flatten()
+    for i, (idx, true_label, pred_label) in enumerate(misclassified_list[:max_samples]):
+        img_tensor, _ = temp_dataset[idx]
+        img = img_tensor.permute(1, 2, 0).numpy()
+        img = np.clip(img, 0, 1)
+        axes[i].imshow(img)
+        axes[i].set_title(f"T: {class_names[true_label]}\nP: {class_names[pred_label]}")
+        axes[i].axis("off")
+    for j in range(i+1, len(axes)):
+        axes[j].axis("off")
+    plt.tight_layout()
+    save_path = MISCLASSIFIED_DIR / "misclassified_samples.png"
+    plt.savefig(save_path)
+    plt.close()
+    print(f"🖼 Misclassified samples saved to: {save_path}")
 
-        self.target_layer.register_forward_hook(forward_hook)
-        self.target_layer.register_full_backward_hook(backward_hook)
-
-    def generate(self, input_tensor, class_idx=None):
-        output = self.model(input_tensor)
-        if class_idx is None:
-            class_idx = torch.argmax(output, dim=1).item()
-
-        self.model.zero_grad()
-        output[0, class_idx].backward(retain_graph=True)
-
-        weights = self.gradients.mean(dim=[2, 3], keepdim=True)
-        cam = (weights * self.activations).sum(dim=1, keepdim=True)
-        cam = torch.relu(cam)
-
-        cam = cam[0].squeeze().cpu().numpy()
-        cam = cv2.resize(cam, (input_tensor.size(2), input_tensor.size(3)))
-        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-        return cam
-
-def visualize_gradcam(model, dataloader, class_names, save_dir):
-    model.eval()
-    gradcam = GradCAM(model, model.model.conv_head)  # Last conv layer of EfficientNetB0
-
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    # Take a few samples from test set
-    count = 0
-    for images, labels in dataloader:
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-        for i in range(len(images)):
-            if count >= 10:  # save 10 examples
-                return
-
-            input_tensor = images[i].unsqueeze(0)
-            cam = gradcam.generate(input_tensor)
-
-            img = preprocess_image(images[i].unsqueeze(0))
-            heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
-            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-            overlay = np.uint8(0.5 * img + 0.5 * heatmap)
-
-            pred = torch.argmax(model(input_tensor)).item()
-            true = labels[i].item()
-
-            fig, ax = plt.subplots(1, 3, figsize=(12, 4))
-            ax[0].imshow(img)
-            ax[0].set_title(f"Original (True: {class_names[true]})")
-            ax[0].axis("off")
-
-            ax[1].imshow(heatmap)
-            ax[1].set_title("Grad-CAM Heatmap")
-            ax[1].axis("off")
-
-            ax[2].imshow(overlay)
-            ax[2].set_title(f"Overlay (Pred: {class_names[pred]})")
-            ax[2].axis("off")
-
-            plt.tight_layout()
-            plt.savefig(save_dir / f"gradcam_{count}.png")
-            plt.close()
-            count += 1
-
+# =======================================================
+# Main evaluation
+# =======================================================
 def main():
-    # --- Load Data ---
-    _, _, test_loader = get_dataloaders(batch_size=1, use_sampler=False)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    MISCLASSIFIED_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load class names
-    label_mapping = json.load(open(ROOT_DIR / "data/processed/label_mapping.json"))
-    class_names = [k for k in sorted(label_mapping.keys(), key=lambda x: label_mapping[x])]
+    # --- Windows multiprocessing fix ---
+    if os.name == "nt":
+        multiprocessing.freeze_support()
+        num_workers = 0
+    else:
+        num_workers = min(multiprocessing.cpu_count() // 2, 4)
 
-    # --- Model ---
-    model = EfficientNetB0(num_classes=len(class_names)).to(DEVICE)
-    checkpoint = ROOT_DIR / "outputs/checkpoints/best_model.pth"
-    model.load_state_dict(torch.load(checkpoint, map_location=DEVICE))
+    # --- DataLoader ---
+    _, _, test_loader, _ = get_dataloaders(
+        batch_size=BATCH_SIZE,
+        num_workers=num_workers,
+        use_sampler=False
+    )
 
-    # --- Generate Grad-CAMs ---
-    visualize_gradcam(model, test_loader, class_names,
-                      save_dir=ROOT_DIR / "outputs/gradcam")
+    # --- Class names ---
+    label_mapping = json.load(open(PROCESSED_DIR / "label_mapping.json"))
+    class_names = [k for k, v in sorted(label_mapping.items(), key=lambda item: item[1])]
+    num_classes = len(class_names)
 
-    print(f"✅ Grad-CAM visualizations saved in: {ROOT_DIR / 'outputs/gradcam'}")
+    # --- Load model ---
+    from src.models import EfficientNetB0
+    model = EfficientNetB0(num_classes=num_classes, pretrained=False).cuda()
+    checkpoint_path = ROOT_DIR / "outputs" / "checkpoints"
+    # Load the latest checkpoint
+    ckpts = sorted(checkpoint_path.glob("*.pth"))
+    if len(ckpts) == 0:
+        raise FileNotFoundError("No checkpoint found in outputs/checkpoints")
+    model.load_state_dict(torch.load(ckpts[-1]))
+    model.eval()
 
+    all_labels = []
+    all_preds = []
+    all_probs = []
+
+    print("⏳ Running evaluation...")
+    with torch.no_grad():
+        for images, labels in tqdm(test_loader, desc="Evaluating"):
+            mask = labels != -1
+            images, labels = images[mask].cuda(), labels[mask].cuda()
+            outputs = model(images)
+            probs = torch.softmax(outputs, dim=1)
+            preds = torch.argmax(probs, dim=1)
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    all_labels_np = np.array(all_labels)
+    all_preds_np = np.array(all_preds)
+    all_probs_np = np.array(all_probs)
+
+    # --- Metrics ---
+    balanced_acc = balanced_accuracy_score(all_labels_np, all_preds_np)
+    print(f"\n📊 Balanced Accuracy: {balanced_acc:.4f}")
+    print("📋 Classification Report:")
+    print(classification_report(all_labels_np, all_preds_np, target_names=class_names))
+
+    # --- Plots ---
+    plot_confusion_matrix(all_labels_np, all_preds_np, class_names, REPORTS_DIR / "confusion_matrix_eval.png")
+
+    y_true_one_hot = np.eye(num_classes)[all_labels_np]
+    plot_roc_curves(y_true_one_hot, all_probs_np, class_names, REPORTS_DIR / "roc_curves.png")
+
+    # --- Misclassified samples ---
+    misclassified_samples = [(i, t, p) for i, (t, p) in enumerate(zip(all_labels_np, all_preds_np)) if t != p]
+    visualize_misclassified_samples(misclassified_samples, class_names)
+
+    print("\n✅ Evaluation complete. Reports saved to:", REPORTS_DIR)
+
+# =======================================================
 if __name__ == "__main__":
     main()
